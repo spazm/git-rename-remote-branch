@@ -9,16 +9,30 @@ use Getopt::Long;
 use IPC::Open2;
 use IPC::Open3;
 use Net::SSH;
+use POSIX qw(:sys_wait_h);
 
 no warnings "experimental::signatures";
 
-my $empty_sha = "0000000000000000000000000000000000000000";
+my $BUFFER_READ_SIZE = 4096;
+my $EMPTY_SHA = "0" x 40;
+# PACK file, version 2, 0 objects + 20 byte sha1 checksum
+my $EMPTY_PACK = pack("A4NN", "PACK", 2, 0);
+$EMPTY_PACK .= sha1($EMPTY_PACK);
+my $GIT_RECEIVE_PACK = "git-receive-pack";
 
-# my $empty_pack_old = pack("A4H56", "PACK", "0000000200000000029d08823bd8a8eab510ad6ac75c823cfd3ed31e");
-my $empty_pack = pack("A4NN", "PACK", 2, 0);  # PACK file, version 2, 0 objects
-$empty_pack .= sha1($empty_pack);             # add 20 byte sha1 checksum
+my $SSH_DIED = 0;
+$SIG{'PIPE'} = sub {
+  $SSH_DIED = 1;
+  say STDERR "SSH process died";
+};
 
 sub format_line($line, $sidechannel=0) {
+  # packet_line format requires a 4 byte header containing the length of the header + line.
+  # newlines are not required at the end of lines, but if included they must be included in the length
+  # 0004 empty message is not allowed
+  # 0000 is a special packet_sync message.
+  # convert empty $line into packet_sync.
+  # If using sidechannel, an additional byte is included after the header to indicate which sidechannel
   my $len = length($line);
   $len += 4 if $len;
   if ($sidechannel) {
@@ -77,6 +91,22 @@ sub parse_args {
   ($remote, $old, $new);
 }
 
+sub read_io_buffer($io, $delay=10) {
+  my $buffer = "";
+  my $tmp_buffer = "";
+  my $done = 0;
+  while (not $done and my @ready = $io->can_read($delay))  {
+    $delay = 1;
+    for my $reader (@ready) {
+      my $bytes_read = sysread($reader, $tmp_buffer, $BUFFER_READ_SIZE);
+      dsay "    read_buffer: read $bytes_read from reader:$reader partial_buffer:[$tmp_buffer]";
+      $buffer .= $tmp_buffer;
+      $done = 1 if not defined($bytes_read) or $bytes_read == 0;
+    }
+  }
+  return $buffer;
+}
+
 sub main {
   my ($remote, $old, $new) = parse_args();
   dsay "Renaming $old to $new";
@@ -92,220 +122,98 @@ sub main {
 
   dsay "  $old has sha: $old_sha";
 
-  my $cmd = rename_remote_branch($old, $new, $old_sha);
-  #dsay "sleeping before";
-  #sleep 6;
-  dsay "cmd: [$cmd]";
-  #dsay "sleeping after";
-  #sleep 3;
-  #return;
-  #TODO: send this message to repo.
-  #for remote, ssh first?
-    if (0 and $remote =~ m/\@/ ) {
-      try_ssh_expect($remote, $cmd);
-      #try_ssh($remote, $cmd);
-    } elsif (1 and $remote =~ m/\@/ ) {
-    dsay "send to ssh";
-    #TODO: check remote for real
-    my ($host, $path) = split(':', $remote);
-    dsay "  connecting to host: $host";
-    my $git_receive_pack = "git-receive-pack";
-    if (1) {
-      my $ssh_cmd = qq(ssh $host $git_receive_pack '$path.git');
-      dsay "ssh_cmd: $ssh_cmd";
-      #my ($rh, $wh) = FileHandle::pipe;
-      my $rh = FileHandle->new();
-      my $wh = FileHandle->new();
-      my $eh = FileHandle->new();
-      $rh->autoflush(1);
-      $wh->autoflush(1);
-      $eh->autoflush(1);
-      binmode($rh);
-      binmode($wh);
-      binmode($eh);
-      #my $pid = open2($rh, $wh, $ssh_cmd);
-      my $pid = open3($wh, $rh, $eh, $ssh_cmd);
-      #dsay("sleeping");
-      #sleep 6;
-      dsay Dumper { pid => $pid, rh=>$rh, wh => $wh , eh => $eh};
-      #dsay Dumper [select([$rh], [$wh], undef, 1)];
-      my $io_read = IO::Select->new($rh);
-      my $io_write = IO::Select->new($wh);
-      my $io_err = IO::Select->new($eh);
-      # three separate selects for clarity in reading.
-      #$io->add($rh, $wh, $eh);
-      #$io->add($wh);
-      dsay Dumper { io_bits => [$io_read->bits(), $io_write->bits()]};
-      dsay Dumper { initial_can_read => [$io_read->can_read(1)],
-                     initial_can_write => [$io_write->can_write(1)]};
-      dsay Dumper { initial_select => [IO::Select->select($io_read, $io_write, $io_err, 1)]};
-
-      # empty initial message from buffer.
-      my $buffer = "";
-      my $BUFFER_READ_SIZE = 4096;
-      $BUFFER_READ_SIZE = 100;
-      READ_1: while (my @ready = $io_read->can_read(10))  {
-        dsay Dumper [read_buffer_can_read => \@ready];
-        for my $reader (@ready) {
-          my $tmp_buffer = "";
-          my $bytes_read = sysread($reader, $tmp_buffer, $BUFFER_READ_SIZE);
-          dsay "    read_buffer: read $bytes_read from reader:$reader partial_buffer:[$tmp_buffer]";
-          $buffer .= $tmp_buffer;
-          last READ_1 if $bytes_read == 0;
-        }
-      }
-      dsay "sysread: $buffer";
-      dsay "TODO: parse buffer";
-      $buffer = "";
-      dsay "checking for exceptions:";
-      READ_ERROR: while (my @ready = $io_err->has_exception(1))  {
-        dsay Dumper [has_excepetion => \@ready];
-        for my $reader (@ready) {
-          my $tmp_buffer = "";
-          my $bytes_read = sysread($reader, $tmp_buffer, $BUFFER_READ_SIZE);
-          dsay "    exception read $bytes_read from reader:$reader partial_buffer:[$tmp_buffer]";
-          $buffer .= $tmp_buffer;
-          last READ_ERROR if $bytes_read == 0;
-        }
-      }
-      dsay "Errors: $buffer";
-
-      dsay("sending to cmd to ssh. length:" . length($cmd));
-      if (my @ready = $io_write->can_write(10)){
-        dsay "clear to send";
-        my $bytes_read = syswrite($ready[0], $cmd);
-        if (defined($bytes_read)) {
-          dsay "success: wrote $bytes_read bytes";
-        } else {
-          dsay "write failed: $!";
-        }
-      }
-
-      dsay("reading response from ssh.");
-      $buffer = "";
-      READ: while (my @ready = $io_read->can_read(10))  {
-        dsay Dumper { server_response_ready_to_read => \@ready };
-        for my $reader (@ready) {
-          my $tmp_buffer;
-          my $bytes_read = sysread($reader, $buffer, $BUFFER_READ_SIZE);
-          if (defined ($bytes_read)) {
-            dsay "    server_response read $bytes_read from reader:$reader buffer:[$tmp_buffer]";
-            $buffer .= $tmp_buffer;
-            last READ if $bytes_read == 0;
-          }else {
-            dsay "    server_response error: $!";
-            last READ;
-          }
-        }
-        dsay "server_response partial buffer: $buffer";
-      }
-      dsay "server_response sysread: $buffer";
-      dsay "ssh filehandle closed";
-      close($wh);
-    } else {
-      open(my $fh, '|-', "ssh $host \"$git_receive_pack '$path'\"")
-        or die "failed to ssh to $host\n";
-      dsay "sleeping";
-      sleep 6;
-      dsay "sending cmd='$cmd'";
-      $fh->autoflush(1);
-      say $fh $cmd;
-      dsay "closing ssh handle";
-      close $fh;
-      dsay "closed ssh handle";
-    }
-  } else {
-    dsay $cmd;
-  }
+  do_it($remote, $old, $new, $old_sha);
+  #do_it_ipc_run($remote, $old, $new, $old_sha);
   dsay "end main";
+}
+
+sub do_it($remote, $old, $new, $old_sha){
+  my $cmd = rename_remote_branch_command($old, $new, $old_sha);
+  # dsay "cmd: [$cmd]";
+
+  # dsay "send to ssh";
+  #TODO: check remote for real
+  my ($user_host, $path) = split(':', $remote);
+  die "repository name is required\n" unless defined $path;
+  $path .= '.git' unless $path =~ m/.git$/;
+  dsay "  connecting to host: $user_host";
+
+  my @ssh_cmd = ("ssh", '-x', $user_host,  $GIT_RECEIVE_PACK, "'$path'");
+  #my @ssh_cmd = ("ssh", $user_host,  $GIT_RECEIVE_PACK, "'$path'");
+  dsay "ssh_cmd: @ssh_cmd";
+  my $rh = FileHandle->new();
+  my $wh = FileHandle->new();
+  my $eh = FileHandle->new();
+  #$rh->autoflush(0);
+  #$wh->autoflush(1);
+  #$eh->autoflush(1);
+  binmode($rh);
+  binmode($wh);
+  binmode($eh);
+
+  my $pid = open3($wh, $rh, $eh, @ssh_cmd);
+  my $io = IO::Select->new($rh, $wh);
+  my $io_err = IO::Select->new($eh);
+
+  # read initial message from buffer.
+  my $initial_msg = read_io_buffer($io, 10);
+  dsay "initial_sysread: $initial_msg";
+
+  dsay "checking for errors";
+  my $error_msg = read_io_buffer($io_err, 1);
+  if (waitpid($pid, WNOHANG)) {
+    die($error_msg);
+  }
+
+  dsay("sending cmd to ssh. length:" . length($cmd));
+  if (my @ready = $io->can_write(10)){
+    dsay "clear to send";
+    my $bytes_read = syswrite($ready[0], $cmd);
+    if (defined($bytes_read)) {
+      dsay "success: wrote $bytes_read bytes";
+    } else {
+      die("write failed: $!\n");
+    }
+  }
+
+  dsay("reading response from ssh.");
+  my $server_response = read_io_buffer($io, 10);
+  dsay "server_response sysread: [$server_response]";
+  dsay "close write handle";
+  close($wh);
+  dsay "wait pid";
+  waitpid($pid, 0);
+  dsay "end doit";
 }
 
 sub rename_main_to_master($sha) {
   rename_remote_branch('master', 'main', $sha);
 }
 
+
 sub rename_remote_branch($old, $new, $sha) {
+  my $cmd = rename_remote_branch_command($old, $new, $sha);
+}
+
+sub rename_remote_branch_command($old, $new, $sha) {
   my ($new_ref, $old_ref) = map "refs/heads/$_", ($new, $old);
   #my $options = "\0 report-status side-band-64k agent=git/2.17.1";
-  #my $options = "\0report-status agent=git/2.17.1";
-  my $options = "\0 report-status side-band-64k agent=git/2.17.1";
-  #my $options = "\0report-status delete-refs side-band-64k quiet atomic ofs-delta";
-  #my $cmd = format_line("$sha $empty_sha $old_ref$options\n")
-  #         . format_line("$empty_sha $sha $new_ref\n")
-  my $cmd = ""
-            . format_line("$sha $empty_sha $old_ref$options\n")
-            . format_line("$empty_sha $sha $new_ref\n")
-            . format_line("")
-            . $empty_pack
-            #format_line(1 . $empty_pack) .
-            # . format_line($empty_pack)
-            # . $empty_pack
-            #. format_line("")  # 'flush' packet.
-            #. format_line("done")
+  my $options = "\0 report-status agent=git/2.17.1";
 
-            # pause here to check reader.
+  # git-receive-pack message format:
+  #   OLD_SHA NEW_SHA BRANCH\0OPTIONS
+  #   OLD_SHA NEW_SHA BRANCH
+  #   OLD_SHA NEW_SHA BRANCH
+  #   SYNC_PACKET
+  #   PACKFILE
 
-            #format_line($empty_pack).
-            #format_line("done");
-            # . "0001"  # packet_delim in pck-line.c aka packet_writer_delim
-            # . "0002" # packet response_end in pck-line.c
-            # packet-writer-write uses \001 as a prefix if use_sideband set.
+  # delete old_ref by setting NEW_SHA to EMPTY
+  # create new_ref by setting OLD_SHA to EMPTY
+  my $cmd = format_line("$sha $EMPTY_SHA $old_ref$options\n") .
+            format_line("$EMPTY_SHA $sha $new_ref\n") .
+            format_line("") .
+            $EMPTY_PACK
             ;
-}
-sub try_ssh($remote, $cmd) {
-  use Net::SSH qw(ssh issh sshopen3);
-  my ($user_host, $path) = split(':', $remote);
-  my $git_receive_pack = "git-receive-pack";
-  my $command = qq($git_receive_pack '${path}'),
-  my ($reader, $writer, $error);
-  my $ssh = Net::SSH->sshopen3($user_host, $writer, $reader, $error, $command);
-}
-sub try_ssh_expect($remote, $cmd) {
-  use Net::SSH::Expect;
-  my ($user_host, $path) = split(':', $remote);
-  my ($user, $host) = split('@', $user_host);
-  my $git_receive_pack = "git-receive-pack --stateless-rpc";
-  my $ssh = Net::SSH::Expect->new (
-    # host => qq($host $git_receive_pack '$path.git'),  #abuse the host param
-    #host => qq($host $git_receive_pack ${path}.git),  #abuse the host param
-    host => $host,
-    binary => '/tmp/em/foo/git-ssh-wrapper',
-    command => qq( $git_receive_pack '${path}.git'),
-    # host => $host,
-    user => $user,
-    debug => 1,
-    #exp_debug => 1,
-  );
-  dsay Dumper $ssh;
-  $ssh->run_ssh() or die "SSH Process couldn't start";
-  dsay "pre peek: " . $ssh->peek(1);
-  while (defined (my $line = $ssh->read_line(1))) {
-    dsay "from login: $line";
-  }
-  dsay "peek: " . $ssh->peek(0);
-
-  dsay "sending cmd:$cmd";
-  $ssh->send($cmd);
-  # $ssh->send("0008done");
-  while (defined (my $line = $ssh->read_line(0))) {
-    dsay "from send_cmd $line";
-  }
-  dsay "peek after send_cmd: " . $ssh->peek(0);
-  $ssh->close();
 }
 
 main();
-
-=pod
-my $empty_sha = "0000000000000000000000000000000000000000";
-my $new_sha   = "9b0e48c18560caf7ef4d007f29b712a0c72f9c14";
-my $new_sha   = "ce672cb77b9780c4ad8b51ed57d4640ef856de49";
-my $ref = 'refs/heads/main';
-my $master_ref = 'refs/heads/master';
-#my $options = "\0 report-status side-band-64k agent=git/2.17.1";
-my $options = "\0 report-status agent=git/2.17.1";
-print format_line("$new_sha $empty_sha $master_ref$options");
-print format_line("$empty_sha $new_sha $ref");
-print format_line("");
-print $empty_pack;
-=cut
