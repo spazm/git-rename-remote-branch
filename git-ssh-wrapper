@@ -1,0 +1,8 @@
+#!/bin/sh
+
+echo "$$ : $@" >&2
+env > /tmp/git-ssh-$$-env && \
+echo "$@" > /tmp/git-ssh-$$-args && \
+tee /tmp/git-ssh-$$-input | \
+ssh "$@" | \
+tee /tmp/git-ssh-$$-output

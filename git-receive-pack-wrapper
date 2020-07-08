@@ -1,0 +1,7 @@
+#!/bin/sh
+
+env > /tmp/git-receive-pack-$$-env && \
+echo "$@" > /tmp/git-receive-pack-$$-args && \
+tee /tmp/git-receive-pack-$$-input | \
+/usr/bin/git-receive-pack "$@" | \
+tee /tmp/git-receive-pack-$$-output
