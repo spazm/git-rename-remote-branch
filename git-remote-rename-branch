@@ -1,30 +1,96 @@
 #!perl
 use v5.26.0;
 use feature 'signatures';
+no warnings "experimental::signatures";
 
+# Core only for distribution
+use Carp qw(croak);
 use Data::Dumper;
 use Digest::SHA1 qw(sha1);
 use FileHandle;
 use Getopt::Long;
-use IPC::Open2;
+use IO::Select;
 use IPC::Open3;
-use Net::SSH;
 use POSIX qw(:sys_wait_h);
 
-no warnings "experimental::signatures";
+# USER OVERRIDE via environment variables
+my $DEBUG = exists $ENV{DEBUG}   ? $ENV{DEBUG}   : 1;
+my $SSH   = exists $ENV{GIT_SSH} ? $ENV{GIT_SSH} : 'ssh';
 
+my $GIT_RECEIVE_PACK = "git-receive-pack";
 my $BUFFER_READ_SIZE = 4096;
-my $EMPTY_SHA = "0" x 40;
+my $EMPTY_SHA        = "0" x 40;
+
 # PACK file, version 2, 0 objects + 20 byte sha1 checksum
 my $EMPTY_PACK = pack("A4NN", "PACK", 2, 0);
 $EMPTY_PACK .= sha1($EMPTY_PACK);
-my $GIT_RECEIVE_PACK = "git-receive-pack";
 
-my $SSH_DIED = 0;
-$SIG{'PIPE'} = sub {
-  $SSH_DIED = 1;
-  say STDERR "SSH process died";
-};
+
+# hacky manual logging to keep this program self-contained + core
+sub trace { say STDERR "TRACE: ", @_ if $DEBUG >= 2 }
+sub debug { say STDERR "DEBUG: ", @_ if $DEBUG >= 1 }
+sub info { say STDERR "INFO: ", @_ if $DEBUG >= 0 }
+sub done($msg) { info $msg; exit(0) }
+sub fatal($msg, $exit_code=1) { say STDERR $msg; exit($exit_code) }
+
+sub usage {
+  my $error = shift;
+  my $usage .= <<"EOF";
+    Usage:
+      ./git rename-remote-branch REMOTE
+      ./git rename-remote-branch REMOTE [OLD] NEW
+
+      renames OLD to NEW.
+      OLD defaults to 'master'
+      NEW defaults to 'main'
+EOF
+  $usage .= "\n\nfatal: $error\n" if $error;
+  if ($error) {
+    fatal($usage, 1);
+  } else {
+    print $usage;
+    exit(0)
+  }
+}
+
+sub main {
+  my $config = config_from_args(@ARGV);
+  info("Renaming '$config->{old_name}' to '$config->{new_name}' on '$config->{remote}'");
+
+  rename_remote_branch($config);
+  info("Complete.  Renamed $config->{old_name} to $config->{new_name}");
+}
+
+sub config_from_args {
+  usage("REMOTE is required") unless @_;
+  usage("Too many arguments") if @_ > 3;
+  my $remote   = shift @_;
+  my $new_name = @_ ? pop @_   : 'main'  ;
+  my $old_name = @_ ? shift @_ : 'master';
+
+  # normalize name and ref
+  $old_name    =~ s,refs/heads/,,;
+  $new_name    =~ s,refs/heads/,,;
+  my $old_ref  = 'refs/heads/' . $old_name;
+  my $new_ref  = 'refs/heads/' . $new_name;
+
+  usage("OLD and NEW must be different names") if $old_name eq $new_name;
+
+  my ($user_host, $path) = split(':', $remote);
+  fatal "repository name is required\n" unless defined $path;
+  $path .= '.git' unless $path =~ m/.git$/;
+
+  my $config = {
+    old_name  => $old_name,
+    old_ref   => $old_ref,
+    new_name  => $new_name,
+    new_ref   => $new_ref,
+    remote    => $remote,
+    user_host => $user_host,
+    path      => $path,
+    sha       => undef,
+  }
+}
 
 sub format_line($line, $sidechannel=0) {
   # packet_line format requires a 4 byte header containing the length of the header + line.
@@ -42,64 +108,17 @@ sub format_line($line, $sidechannel=0) {
   }
 }
 
-sub get_branch_sha($remote, $old, $new) {
-  # Use git ls-remote to retrieve branch information from repository
-  # return a hashref of fully qualified branch (refs/heads/$branch) to sha
-  my $branch_sha = {};
-  open(my $ls_remote, '-|', "git ls-remote $remote $old $new")
-    || die "git ls-remote failed for remote$remote\n";
-
-  while(my $line = <$ls_remote>) {
-    my ($sha, $branch) = split(/\s+/, $line);
-    $branch_sha->{$branch} = $sha;
-  }
-  $branch_sha;
-}
-
-my $DEBUG = 1;
-sub dsay {
-  say STDERR @_ if $DEBUG;
-}
-
-sub usage {
-  my $error = shift;
-  my $usage .= <<"EOF";
-    Usage:
-      ./git rename-remote-branch REMOTE
-      ./git rename-remote-branch REMOTE [OLD] NEW
-
-      renames OLD to NEW.
-      OLD defaults to 'master'
-      NEW defaults to 'main'
-EOF
-  $usage .= "\n\nfatal: $error\n" if $error;
-  die($usage);
-}
-
-sub parse_args {
-  usage("REMOTE is required") unless @ARGV;
-  usage("Too many arguments") if @ARGV > 3;
-  my $old = "master";
-  my $new = "main";
-  my $remote = shift @ARGV;
-  $new       = pop   @ARGV if @ARGV;
-  $old       = shift @ARGV if @ARGV;
-
-  $old =~ s,refs/heads/,,;
-  $new =~ s,refs/heads/,,;
-  usage("OLD and NEW must be different names") if $old eq $new;
-  ($remote, $old, $new);
-}
-
 sub read_io_buffer($io, $delay=10) {
+  # Convenience method to do non-blocking sysread on a filehandle.
+  # read will be blocking if $delay is 0
   my $buffer = "";
   my $tmp_buffer = "";
   my $done = 0;
   while (not $done and my @ready = $io->can_read($delay))  {
     $delay = 1;
-    for my $reader (@ready) {
+    foreach my $reader (@ready) {
       my $bytes_read = sysread($reader, $tmp_buffer, $BUFFER_READ_SIZE);
-      dsay "    read_buffer: read $bytes_read from reader:$reader partial_buffer:[$tmp_buffer]";
+      trace("    read_buffer: read $bytes_read from reader:$reader partial_buffer:[$tmp_buffer]");
       $buffer .= $tmp_buffer;
       $done = 1 if not defined($bytes_read) or $bytes_read == 0;
     }
@@ -107,96 +126,136 @@ sub read_io_buffer($io, $delay=10) {
   return $buffer;
 }
 
-sub main {
-  my ($remote, $old, $new) = parse_args();
-  dsay "Renaming $old to $new";
-  dsay "  on remote: $remote";
+sub rename_remote_branch($config) {
 
-  my $branch_sha = get_branch_sha($remote, $old, $new);
-  my $old_sha = $branch_sha->{"refs/heads/$old"};
-  my $new_sha = $branch_sha->{"refs/heads/$new"};
 
-  die "already complete\n" if !$old_sha and $new_sha;
-  die "$old does not exist in remote\n" unless $old_sha;
-  die "$new already exists in remote\n" if $new_sha;
-
-  dsay "  $old has sha: $old_sha";
-
-  do_it($remote, $old, $new, $old_sha);
-  #do_it_ipc_run($remote, $old, $new, $old_sha);
-  dsay "end main";
-}
-
-sub do_it($remote, $old, $new, $old_sha){
-  my $cmd = rename_remote_branch_command($old, $new, $old_sha);
-  # dsay "cmd: [$cmd]";
-
-  # dsay "send to ssh";
-  #TODO: check remote for real
-  my ($user_host, $path) = split(':', $remote);
-  die "repository name is required\n" unless defined $path;
-  $path .= '.git' unless $path =~ m/.git$/;
-  dsay "  connecting to host: $user_host";
-
-  my @ssh_cmd = ("ssh", '-x', $user_host,  $GIT_RECEIVE_PACK, "'$path'");
-  #my @ssh_cmd = ("ssh", $user_host,  $GIT_RECEIVE_PACK, "'$path'");
-  dsay "ssh_cmd: @ssh_cmd";
+  my @ssh_cmd = ($SSH, '-x', $config->{user_host}, $GIT_RECEIVE_PACK, "'$config->{path}'");
+  debug("ssh_cmd: @ssh_cmd");
   my $rh = FileHandle->new();
   my $wh = FileHandle->new();
   my $eh = FileHandle->new();
-  #$rh->autoflush(0);
-  #$wh->autoflush(1);
-  #$eh->autoflush(1);
-  binmode($rh);
-  binmode($wh);
-  binmode($eh);
 
   my $pid = open3($wh, $rh, $eh, @ssh_cmd);
+  # does this work with scoping?
+  # my $pid = open3(my $wh = FileHandle->new(), my $rh = FileHandle->new, my $eh = Filehandle->new, @ssh_cmd);
+
+  # open3 opens the handles, need to set binmode after open and before reading/writing.
+  binmode($rh, ':raw');
+  binmode($wh, ':raw');
+  binmode($eh, ':raw');
+
   my $io = IO::Select->new($rh, $wh);
-  my $io_err = IO::Select->new($eh);
+  my $io_err = IO::Select->new($eh);  # error messages appear in can_read() instead of has_exceptions()!
 
   # read initial message from buffer.
-  my $initial_msg = read_io_buffer($io, 10);
-  dsay "initial_sysread: $initial_msg";
-
-  dsay "checking for errors";
-  my $error_msg = read_io_buffer($io_err, 1);
-  if (waitpid($pid, WNOHANG)) {
-    die($error_msg);
+  my $sha;
+  {
+    my $initial_msg = read_io_buffer($io, 10);
+    trace("initial_sysread: $initial_msg");
+    $sha = verify_branches($config, $initial_msg);
   }
+  my $cmd = rename_remote_branch_command($config);
+  trace("remote cmd: [$cmd]");
 
-  dsay("sending cmd to ssh. length:" . length($cmd));
+  # we only care about errors from ssh at the beginning, e.g. if our repo is rejected.
+  my $error_msg = read_io_buffer($io_err, 1);
+  fatal($error_msg) if (waitpid($pid, WNOHANG));
+
+  debug ("sending cmd to ssh. length:" . length($cmd));
   if (my @ready = $io->can_write(10)){
-    dsay "clear to send";
-    my $bytes_read = syswrite($ready[0], $cmd);
-    if (defined($bytes_read)) {
-      dsay "success: wrote $bytes_read bytes";
+    my $bytes_written = syswrite($ready[0], $cmd);
+    if (defined($bytes_written)) {
+      debug "success: wrote $bytes_written bytes";
     } else {
-      die("write failed: $!\n");
+      fatal("write failed: $!");
     }
   }
 
-  dsay("reading response from ssh.");
   my $server_response = read_io_buffer($io, 10);
-  dsay "server_response sysread: [$server_response]";
-  dsay "close write handle";
+  trace "server_response sysread: [$server_response]";
+  verify_update_response($config, $server_response);
+
   close($wh);
-  dsay "wait pid";
   waitpid($pid, 0);
-  dsay "end doit";
 }
 
-sub rename_main_to_master($sha) {
-  rename_remote_branch('master', 'main', $sha);
+sub verify_branches($config, $initial_msg) {
+  # Check that $old exists and $new does not
+  # return the SHA for $old
+  #
+  # git-receive-pack initial message, in pck_line format
+  # SHA refs/heads/$branch1\0$options
+  # SHA refs/heads/$branch2
+  # ...
+  # SHA refs/heads/$branchn
+  # ""
+  my ($old_sha, $new_sha);
+  foreach my $line (split(/\n/, $initial_msg)){
+    if ($line =~ m|(\w{40}) \s+ (refs/heads/[^\x00]+)|x) {
+      # we don't need the whole hash of branch names, just the two we want.
+      debug("Found branch[$2] with sha[$1]");
+      $old_sha = $1 if $2 eq $config->{old_ref};
+      $new_sha = $1 if $2 eq $config->{new_ref};
+    } elsif ($line == '0000' ) {
+      # redundant, the 0000 message should be the last line.
+      last;
+    }
+  }
+  $config->{sha} = $old_sha;
+
+  done "already complete" if !$old_sha and $new_sha;
+  fatal "$config->{old_name} does not exist in remote" unless $old_sha;
+  fatal "$config->{new_name} already exists in remote" if $new_sha;
+  return $old_sha;
 }
 
-
-sub rename_remote_branch($old, $new, $sha) {
-  my $cmd = rename_remote_branch_command($old, $new, $sha);
+sub decode_pack_lines($msg) {
+  my @msgs = ();
+  my $offset = 0;
+  while ($offset < length($msg) ){
+    my $len = hex(substr($msg, $offset, 4));
+    $len = 4 if $len == 0;
+    if ($len > 4){
+      my $m = substr($msg, $offset + 4, $len - 4);
+      trace "offset: $offset, len:$len, m:[$m]";
+      chomp($m);
+      push @msgs, $m;
+    }
+    $offset += $len;
+  }
+  return @msgs
 }
 
-sub rename_remote_branch_command($old, $new, $sha) {
-  my ($new_ref, $old_ref) = map "refs/heads/$_", ($new, $old);
+sub verify_update_response($config, $msg) {
+  my @msgs = decode_pack_lines($msg);
+  # Expected response:
+  #     unpack ok
+  #     ok $ref
+  #     ok $ref
+  #
+  # Note: OK message order is not guaranteed
+
+  if (@msgs != 3 or shift(@msgs) ne "unpack ok") {
+    debug $_ foreach @msgs;
+    fatal("message was not successfully received and unpacked");
+  }
+
+  my %ok;
+  foreach my $line (@msgs){
+    if ($line =~ m/ok (.*)/ ) {
+      $ok{$1} = 1;
+    } else {
+      fatal "invalid OK reponse: $line\n";
+    }
+  }
+  unless ($ok{$config->{new_ref}} and $ok{$config->{old_ref}}) {
+    debug $_ foreach @msgs;
+    fatal("OK message missing");
+  }
+  return 1;
+}
+
+sub rename_remote_branch_command($config) {
   #my $options = "\0 report-status side-band-64k agent=git/2.17.1";
   my $options = "\0 report-status agent=git/2.17.1";
 
@@ -206,11 +265,14 @@ sub rename_remote_branch_command($old, $new, $sha) {
   #   OLD_SHA NEW_SHA BRANCH
   #   SYNC_PACKET
   #   PACKFILE
+  #
+  # set OLD_SHA to EMPTY_SHA to create a branch
+  # set NEW_SHA to EMPTY_SHA to delete a branch
 
   # delete old_ref by setting NEW_SHA to EMPTY
   # create new_ref by setting OLD_SHA to EMPTY
-  my $cmd = format_line("$sha $EMPTY_SHA $old_ref$options\n") .
-            format_line("$EMPTY_SHA $sha $new_ref\n") .
+  my $cmd = format_line("$config->{sha} $EMPTY_SHA $config->{old_ref}$options\n") .
+            format_line("$EMPTY_SHA $config->{sha} $config->{new_ref}\n") .
             format_line("") .
             $EMPTY_PACK
             ;
