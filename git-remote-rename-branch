@@ -1,11 +1,11 @@
-#!perl
-use v5.26.0;
-use feature 'signatures';
-no warnings "experimental::signatures";
+#!/usr/bin/env perl
+package GitRename;
+
+use v5.14.0;
+use strict;
+use warnings;
 
 # Core only for distribution
-use Carp qw(croak);
-use Data::Dumper;
 use Digest::SHA1 qw(sha1);
 use FileHandle;
 use Getopt::Long;
@@ -14,85 +14,76 @@ use IPC::Open3;
 use POSIX qw(:sys_wait_h);
 
 # USER OVERRIDE via environment variables
-my $DEBUG = exists $ENV{DEBUG}   ? $ENV{DEBUG}   : 1;
-my $SSH   = exists $ENV{GIT_SSH} ? $ENV{GIT_SSH} : 'ssh';
+our $DEBUG = exists $ENV{DEBUG}   ? $ENV{DEBUG}   : 1;
+our $SSH   = exists $ENV{GIT_SSH} ? $ENV{GIT_SSH} : 'ssh';
 
 my $GIT_RECEIVE_PACK = "git-receive-pack";
-my $BUFFER_READ_SIZE = 4096;
+my $BUFFER_READ_SIZE = 100; #4096;
 my $EMPTY_SHA        = "0" x 40;
 
 # PACK file, version 2, 0 objects + 20 byte sha1 checksum
 my $EMPTY_PACK = pack("A4NN", "PACK", 2, 0);
 $EMPTY_PACK .= sha1($EMPTY_PACK);
 
-
 # hacky manual logging to keep this program self-contained + core
 sub trace { say STDERR "TRACE: ", @_ if $DEBUG >= 2 }
 sub debug { say STDERR "DEBUG: ", @_ if $DEBUG >= 1 }
-sub info { say STDERR "INFO: ", @_ if $DEBUG >= 0 }
-sub done($msg) { info $msg; exit(0) }
-sub fatal($msg, $exit_code=1) { say STDERR $msg; exit($exit_code) }
+sub info  { say STDERR "INFO:  ", @_ if $DEBUG >= 0 }
+sub done  { info @_ if @_;    exit(0) }
+sub fatal { say STDERR $_[0]; exit($_[1] // 1 ) }
+
+sub main {
+  my ($repo, $old_name, $new_name) = parse_args(@ARGV);
+  my $config = GitRename->new($repo, $old_name, $new_name);
+
+  info("Renaming '$config->{old_name}' to '$config->{new_name}' on '$config->{remote}'");
+
+  $config->rename_remote_branch();
+  info("Complete.  Renamed $config->{old_name} to $config->{new_name}");
+}
 
 sub usage {
   my $error = shift;
   my $usage .= <<"EOF";
     Usage:
-      ./git rename-remote-branch REMOTE
-      ./git rename-remote-branch REMOTE [OLD] NEW
+      ./git rename-remote-branch [options] REMOTE
+      ./git rename-remote-branch [options] REMOTE [OLD] NEW
+
+      options:
+        --verbose|-v: increase verbosity
+        --quiet|-q:   decrease verbosity
+        --help:       this message
 
       renames OLD to NEW.
       OLD defaults to 'master'
       NEW defaults to 'main'
 EOF
-  $usage .= "\n\nfatal: $error\n" if $error;
   if ($error) {
+    $usage .= "\n\nfatal: $error";
     fatal($usage, 1);
   } else {
-    print $usage;
+    say $usage;
     exit(0)
   }
 }
 
-sub main {
-  my $config = config_from_args(@ARGV);
-  info("Renaming '$config->{old_name}' to '$config->{new_name}' on '$config->{remote}'");
-
-  rename_remote_branch($config);
-  info("Complete.  Renamed $config->{old_name} to $config->{new_name}");
-}
-
-sub config_from_args {
+sub parse_args {
   usage("REMOTE is required") unless @_;
   usage("Too many arguments") if @_ > 3;
   my $remote   = shift @_;
   my $new_name = @_ ? pop @_   : 'main'  ;
   my $old_name = @_ ? shift @_ : 'master';
 
-  # normalize name and ref
   $old_name    =~ s,refs/heads/,,;
   $new_name    =~ s,refs/heads/,,;
-  my $old_ref  = 'refs/heads/' . $old_name;
-  my $new_ref  = 'refs/heads/' . $new_name;
 
-  usage("OLD and NEW must be different names") if $old_name eq $new_name;
-
-  my ($user_host, $path) = split(':', $remote);
-  fatal "repository name is required\n" unless defined $path;
-  $path .= '.git' unless $path =~ m/.git$/;
-
-  my $config = {
-    old_name  => $old_name,
-    old_ref   => $old_ref,
-    new_name  => $new_name,
-    new_ref   => $new_ref,
-    remote    => $remote,
-    user_host => $user_host,
-    path      => $path,
-    sha       => undef,
-  }
+  ($remote, $old_name, $new_name);
 }
 
-sub format_line($line, $sidechannel=0) {
+# Convenience Functions
+sub format_line {
+  my ($line, $sidechannel) = @_;
+  $sidechannel //= 0;
   # packet_line format requires a 4 byte header containing the length of the header + line.
   # newlines are not required at the end of lines, but if included they must be included in the length
   # 0004 empty message is not allowed
@@ -108,108 +99,11 @@ sub format_line($line, $sidechannel=0) {
   }
 }
 
-sub read_io_buffer($io, $delay=10) {
-  # Convenience method to do non-blocking sysread on a filehandle.
-  # read will be blocking if $delay is 0
-  my $buffer = "";
-  my $tmp_buffer = "";
-  my $done = 0;
-  while (not $done and my @ready = $io->can_read($delay))  {
-    $delay = 1;
-    foreach my $reader (@ready) {
-      my $bytes_read = sysread($reader, $tmp_buffer, $BUFFER_READ_SIZE);
-      trace("    read_buffer: read $bytes_read from reader:$reader partial_buffer:[$tmp_buffer]");
-      $buffer .= $tmp_buffer;
-      $done = 1 if not defined($bytes_read) or $bytes_read == 0;
-    }
-  }
-  return $buffer;
-}
-
-sub rename_remote_branch($config) {
-
-
-  my @ssh_cmd = ($SSH, '-x', $config->{user_host}, $GIT_RECEIVE_PACK, "'$config->{path}'");
-  debug("ssh_cmd: @ssh_cmd");
-  my $rh = FileHandle->new();
-  my $wh = FileHandle->new();
-  my $eh = FileHandle->new();
-
-  my $pid = open3($wh, $rh, $eh, @ssh_cmd);
-  # does this work with scoping?
-  # my $pid = open3(my $wh = FileHandle->new(), my $rh = FileHandle->new, my $eh = Filehandle->new, @ssh_cmd);
-
-  # open3 opens the handles, need to set binmode after open and before reading/writing.
-  binmode($rh, ':raw');
-  binmode($wh, ':raw');
-  binmode($eh, ':raw');
-
-  my $io = IO::Select->new($rh, $wh);
-  my $io_err = IO::Select->new($eh);  # error messages appear in can_read() instead of has_exceptions()!
-
-  # read initial message from buffer.
-  my $sha;
-  {
-    my $initial_msg = read_io_buffer($io, 10);
-    trace("initial_sysread: $initial_msg");
-    $sha = verify_branches($config, $initial_msg);
-  }
-  my $cmd = rename_remote_branch_command($config);
-  trace("remote cmd: [$cmd]");
-
-  # we only care about errors from ssh at the beginning, e.g. if our repo is rejected.
-  my $error_msg = read_io_buffer($io_err, 1);
-  fatal($error_msg) if (waitpid($pid, WNOHANG));
-
-  debug ("sending cmd to ssh. length:" . length($cmd));
-  if (my @ready = $io->can_write(10)){
-    my $bytes_written = syswrite($ready[0], $cmd);
-    if (defined($bytes_written)) {
-      debug "success: wrote $bytes_written bytes";
-    } else {
-      fatal("write failed: $!");
-    }
-  }
-
-  my $server_response = read_io_buffer($io, 10);
-  trace "server_response sysread: [$server_response]";
-  verify_update_response($config, $server_response);
-
-  close($wh);
-  waitpid($pid, 0);
-}
-
-sub verify_branches($config, $initial_msg) {
-  # Check that $old exists and $new does not
-  # return the SHA for $old
-  #
-  # git-receive-pack initial message, in pck_line format
-  # SHA refs/heads/$branch1\0$options
-  # SHA refs/heads/$branch2
-  # ...
-  # SHA refs/heads/$branchn
-  # ""
-  my ($old_sha, $new_sha);
-  foreach my $line (split(/\n/, $initial_msg)){
-    if ($line =~ m|(\w{40}) \s+ (refs/heads/[^\x00]+)|x) {
-      # we don't need the whole hash of branch names, just the two we want.
-      debug("Found branch[$2] with sha[$1]");
-      $old_sha = $1 if $2 eq $config->{old_ref};
-      $new_sha = $1 if $2 eq $config->{new_ref};
-    } elsif ($line == '0000' ) {
-      # redundant, the 0000 message should be the last line.
-      last;
-    }
-  }
-  $config->{sha} = $old_sha;
-
-  done "already complete" if !$old_sha and $new_sha;
-  fatal "$config->{old_name} does not exist in remote" unless $old_sha;
-  fatal "$config->{new_name} already exists in remote" if $new_sha;
-  return $old_sha;
-}
-
-sub decode_pack_lines($msg) {
+sub decode_pack_lines {
+  # decode variable length encoded lines.
+  # 4 byte header containing the length of the rest of the message
+  # newlines may be used between messages, but must be included in the length.
+  my $msg = shift;
   my @msgs = ();
   my $offset = 0;
   while ($offset < length($msg) ){
@@ -226,14 +120,184 @@ sub decode_pack_lines($msg) {
   return @msgs
 }
 
-sub verify_update_response($config, $msg) {
-  my @msgs = decode_pack_lines($msg);
+sub read_io_buffer {
+  my ($io, $delay) = @_;
+  $delay //= 10;
+
+  # Convenience method to do non-blocking sysread on a filehandle.
+  # read will be blocking if $delay is 0
+  my $buffer     = "";
+  my $tmp_buffer = "";
+  my $done       = 0;
+
+  while (not $done and my @ready = $io->can_read($delay))  {
+    $delay = 1;
+    use Data::Dumper;
+    debug(Dumper \@ready);
+    foreach my $reader (@ready) {
+      my $bytes_read = sysread($reader, $tmp_buffer, $BUFFER_READ_SIZE);
+      trace("    read_buffer: read $bytes_read from reader.  partial_buffer:[$tmp_buffer]");
+      $buffer .= $tmp_buffer;
+      $done = 1 if not defined($bytes_read) or $bytes_read == 0;
+    }
+  }
+  return $buffer;
+}
+
+
+sub new {
+  my ($class, $remote, $old_name, $new_name) = @_;
+
+  # normalize name and ref
+  $old_name    =~ s,refs/heads/,,;
+  $new_name    =~ s,refs/heads/,,;
+  my $old_ref  = 'refs/heads/' . $old_name;
+  my $new_ref  = 'refs/heads/' . $new_name;
+
+  usage("OLD and NEW must be different names") if $old_name eq $new_name;
+
+  my ($user_host, $path) = split(':', $remote);
+  usage("repository name is required") unless defined $path;
+  $path .= '.git' unless $path =~ m/.git$/;
+
+  bless my $self = {
+    old_name  => $old_name,
+    old_ref   => $old_ref,
+    new_name  => $new_name,
+    new_ref   => $new_ref,
+    remote    => $remote,
+    user_host => $user_host,
+    path      => $path,
+    sha       => undef,
+  }, $class
+}
+
+sub open_ssh {
+  my $self = shift;
+  my @ssh_cmd = ($SSH, '-x', $self->{user_host}, $GIT_RECEIVE_PACK, "'$self->{path}'");
+  debug("ssh_cmd: @ssh_cmd");
+
+  my $pid = open3(
+    my $wh = FileHandle->new(),
+    my $rh = FileHandle->new(),
+    my $eh = FileHandle->new(),
+    @ssh_cmd
+  );
+
+  # open3 opens the handles, need to set binmode after open and before reading/writing.
+  binmode($rh, ':raw');
+  binmode($wh, ':raw');
+  binmode($eh, ':raw');
+
+  # use separate reader/writer because ->can_read occasionally returns the writer.
+  my $io_read  = IO::Select->new($rh);
+  my $io_write = IO::Select->new($wh);
+  my $io_err   = IO::Select->new($eh);  # error messages appear in can_read() instead of has_exceptions()!
+
+  $self->{io_read}  = $io_read;
+  $self->{io_write} = $io_write;
+  $self->{io_err}   = $io_err;
+  $self->{pid}      = $pid;
+
+  return $wh;
+}
+
+sub read_welcome_message {
+  my $self = shift;
+  my $initial_msg = read_io_buffer($self->{io_read}, 10);
+  trace("welcome message sysread: $initial_msg");
+  $self->verify_branches($initial_msg);
+  return $initial_msg;
+}
+sub check_for_error_message {
+  my $self = shift;
+  my $error_msg = read_io_buffer($self->{io_err}, 1);
+  trace("error_message sysread: $error_msg") if $error_msg;
+  fatal($error_msg) if (waitpid($self->{pid}, WNOHANG));
+  return $error_msg;
+}
+
+sub write_rename_message {
+  my $self = shift;
+  my $cmd = rename_remote_branch_command($self);
+  trace("remote cmd: [$cmd]");
+
+  my $bytes_written = 0;
+  debug ("sending cmd to ssh. length:" . length($cmd));
+  if (my @ready = $self->{io_write}->can_write(10)){
+    $bytes_written = syswrite($ready[0], $cmd);
+    if (defined($bytes_written)) {
+      debug "success: wrote $bytes_written bytes";
+    } else {
+      fatal("write failed: $!");
+    }
+  }
+  return $bytes_written;
+}
+
+sub read_confirmation_message {
+  my $self = shift;
+  my $server_response = read_io_buffer($self->{io_read}, 10);
+  trace "confirmation message sysread: [$server_response]";
+  $self->verify_update_response($server_response);
+  return $server_response;
+}
+
+sub rename_remote_branch {
+  my $self = shift;
+  my $wh = $self->open_ssh($self);
+
+  $self->read_welcome_message();
+  # we only care about errors from ssh at the beginning, e.g. if our repo is rejected.
+  $self->check_for_error_message();
+  $self->write_rename_message();
+  $self->read_confirmation_message();
+
+  close($wh);
+  waitpid($self->{pid}, 0);
+}
+
+sub verify_branches {
+  my ($self, $initial_msg) = @_;
+  # Check that $old exists and $new does not
+  # return the SHA for $old
+  #
+  # git-receive-pack initial message, in pck_line format
+  # SHA refs/heads/$branch1\0$options
+  # SHA refs/heads/$branch2
+  # ...
+  # SHA refs/heads/$branchn
+  # ""
+  my ($old_sha, $new_sha);
+  foreach my $line (split(/\n/, $initial_msg)){
+    if ($line =~ m|(\w{40}) \s+ (refs/heads/[^\x00]+)|x) {
+      # we don't need the whole hash of branch names, just the two we want.
+      debug("Found branch[$2] with sha[$1]");
+      $old_sha = $1 if $2 eq $self->{old_ref};
+      $new_sha = $1 if $2 eq $self->{new_ref};
+    } elsif ($line == '0000' ) {
+      # redundant, the 0000 message should be the last line.
+      last;
+    }
+  }
+  $self->{sha} = $old_sha;
+
+  done "already complete" if !$old_sha and $new_sha;
+  fatal "$self->{old_name} does not exist in remote" unless $old_sha;
+  fatal "$self->{new_name} already exists in remote" if $new_sha;
+  return 1;
+}
+
+sub verify_update_response {
   # Expected response:
   #     unpack ok
   #     ok $ref
   #     ok $ref
   #
   # Note: OK message order is not guaranteed
+
+  my ($self, $msg) = @_;
+  my @msgs = decode_pack_lines($msg);
 
   if (@msgs != 3 or shift(@msgs) ne "unpack ok") {
     debug $_ foreach @msgs;
@@ -248,14 +312,15 @@ sub verify_update_response($config, $msg) {
       fatal "invalid OK reponse: $line\n";
     }
   }
-  unless ($ok{$config->{new_ref}} and $ok{$config->{old_ref}}) {
+  unless ($ok{$self->{new_ref}} and $ok{$self->{old_ref}}) {
     debug $_ foreach @msgs;
-    fatal("OK message missing");
+    fatal("OK message missing", 2);
   }
   return 1;
 }
 
-sub rename_remote_branch_command($config) {
+sub rename_remote_branch_command {
+  my $self = shift;
   #my $options = "\0 report-status side-band-64k agent=git/2.17.1";
   my $options = "\0 report-status agent=git/2.17.1";
 
@@ -271,11 +336,11 @@ sub rename_remote_branch_command($config) {
 
   # delete old_ref by setting NEW_SHA to EMPTY
   # create new_ref by setting OLD_SHA to EMPTY
-  my $cmd = format_line("$config->{sha} $EMPTY_SHA $config->{old_ref}$options\n") .
-            format_line("$EMPTY_SHA $config->{sha} $config->{new_ref}\n") .
+  my $cmd = format_line("$self->{sha} $EMPTY_SHA $self->{old_ref}$options\n") .
+            format_line("$EMPTY_SHA $self->{sha} $self->{new_ref}\n") .
             format_line("") .
             $EMPTY_PACK
             ;
 }
 
-main();
+main() if not caller();
