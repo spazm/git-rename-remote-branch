@@ -7,10 +7,11 @@ use warnings;
 
 # Core only for distribution
 use Digest::SHA1 qw(sha1);
-use FileHandle;
-use Getopt::Long;
-use IO::Select;
-use IPC::Open3;
+use FileHandle ();
+use Getopt::Long v2.32 qw(:config bundling auto_version);
+use IO::Select () ;
+use IPC::Open3 qw(open3);
+use Pod::Usage qw(pod2usage);
 use POSIX qw(:sys_wait_h);
 
 # USER OVERRIDE via environment variables
@@ -18,7 +19,7 @@ our $DEBUG = exists $ENV{DEBUG}   ? $ENV{DEBUG}   : 1;
 our $SSH   = exists $ENV{GIT_SSH} ? $ENV{GIT_SSH} : 'ssh';
 
 my $GIT_RECEIVE_PACK = "git-receive-pack";
-my $BUFFER_READ_SIZE = 100; #4096;
+my $BUFFER_READ_SIZE = 4096;
 my $EMPTY_SHA        = "0" x 40;
 
 # PACK file, version 2, 0 objects + 20 byte sha1 checksum
@@ -33,63 +34,71 @@ sub done  { info @_ if @_;    exit(0) }
 sub fatal { say STDERR $_[0]; exit($_[1] // 1 ) }
 
 sub main {
-  my ($repo, $old_name, $new_name) = parse_args(@ARGV);
-  my $config = GitRename->new($repo, $old_name, $new_name);
+  my ($repo, $old_name, $new_name) = parse_args();
+  my $git = GitRename->new($repo, $old_name, $new_name);
 
-  info("Renaming '$config->{old_name}' to '$config->{new_name}' on '$config->{remote}'");
-
-  $config->rename_remote_branch();
-  info("Complete.  Renamed $config->{old_name} to $config->{new_name}");
-}
-
-sub usage {
-  my $error = shift;
-  my $usage .= <<"EOF";
-    Usage:
-      ./git rename-remote-branch [options] REMOTE
-      ./git rename-remote-branch [options] REMOTE [OLD] NEW
-
-      options:
-        --verbose|-v: increase verbosity
-        --quiet|-q:   decrease verbosity
-        --help:       this message
-
-      renames OLD to NEW.
-      OLD defaults to 'master'
-      NEW defaults to 'main'
-EOF
-  if ($error) {
-    $usage .= "\n\nfatal: $error";
-    fatal($usage, 1);
-  } else {
-    say $usage;
-    exit(0)
-  }
+  info("Renaming '$git->{old_name}' to '$git->{new_name}' on '$git->{remote}'");
+  $git->rename_remote_branch();
+  info("Complete.  Renamed $git->{old_name} to $git->{new_name}");
 }
 
 sub parse_args {
-  usage("REMOTE is required") unless @_;
-  usage("Too many arguments") if @_ > 3;
-  my $remote   = shift @_;
-  my $new_name = @_ ? pop @_   : 'main'  ;
-  my $old_name = @_ ? shift @_ : 'master';
+  # Configure option parsing to mimic other git commands
+  #
+  # Parse command line flags with Getopt::Long and then
+  # manually read and verify the three positional arguments:
+  #   <repository> <old_branch> <new_branch>
+  #
+  # returns (repo, old_name, new_name)
 
+  my %opt = (
+    'receive-pack-git' => \$GIT_RECEIVE_PACK,
+    'verbose'          => 0,
+  );
+  my $result = GetOptions(
+    \%opt,
+    "verbose|v+",
+    "quiet|q",
+    "receive-pack-git|exec=s",
+    "man",
+    "help",
+  );
+  pod2usage(1) if $opt{help};
+  pod2usage(-exitval => 0, -verbose =>2) if $opt{man};
+  pod2usage(2) if !$result;
+
+  $DEBUG += $opt{verbose};
+  $DEBUG = -1 if $opt{quiet};
+
+  if (@ARGV < 3 ){
+    pod2usage(-msg => "<repository>, <old_branch>, and <new_branch> are all requied", -exitval => 1);
+  } elsif (@ARGV > 3) {
+    pod2usage(-msg => "Too many arguments", -exitval => 1);
+  }
+
+  my ($remote, $old_name, $new_name) = @ARGV;
   $old_name    =~ s,refs/heads/,,;
   $new_name    =~ s,refs/heads/,,;
 
   ($remote, $old_name, $new_name);
 }
 
-# Convenience Functions
+### Convenience Functions ###
+
 sub format_line {
-  my ($line, $sidechannel) = @_;
-  $sidechannel //= 0;
-  # packet_line format requires a 4 byte header containing the length of the header + line.
-  # newlines are not required at the end of lines, but if included they must be included in the length
+  # packet_line format requires a 4 byte hex header containing the length
+  # of the line, including header.
+  # newlines are not required at the end of lines. If present they must be
+  # included in the length
+  #
   # 0004 empty message is not allowed
   # 0000 is a special packet_sync message.
-  # convert empty $line into packet_sync.
+  # => we convert empty $line into packet_sync.
+  #
   # If using sidechannel, an additional byte is included after the header to indicate which sidechannel
+
+  my ($line, $sidechannel) = @_;
+  $sidechannel //= 0;
   my $len = length($line);
   $len += 4 if $len;
   if ($sidechannel) {
@@ -103,6 +112,7 @@ sub decode_pack_lines {
   # decode variable length encoded lines.
   # 4 byte header containing the length of the rest of the message
   # newlines may be used between messages, but must be included in the length.
+
   my $msg = shift;
   my @msgs = ();
   my $offset = 0;
@@ -121,19 +131,19 @@ sub decode_pack_lines {
 }
 
 sub read_io_buffer {
+  # Convenience method to do non-blocking sysread on a filehandle.
+  # read will be blocking if $delay is 0
+  # delay is lowered to 1 after the initial read.
+
   my ($io, $delay) = @_;
   $delay //= 10;
 
-  # Convenience method to do non-blocking sysread on a filehandle.
-  # read will be blocking if $delay is 0
   my $buffer     = "";
   my $tmp_buffer = "";
   my $done       = 0;
 
   while (not $done and my @ready = $io->can_read($delay))  {
     $delay = 1;
-    use Data::Dumper;
-    debug(Dumper \@ready);
     foreach my $reader (@ready) {
       my $bytes_read = sysread($reader, $tmp_buffer, $BUFFER_READ_SIZE);
       trace("    read_buffer: read $bytes_read from reader.  partial_buffer:[$tmp_buffer]");
@@ -154,10 +164,10 @@ sub new {
   my $old_ref  = 'refs/heads/' . $old_name;
   my $new_ref  = 'refs/heads/' . $new_name;
 
-  usage("OLD and NEW must be different names") if $old_name eq $new_name;
+  pod2usage("<old_branch> and <new_branch> must be different") if $old_name eq $new_name;
 
   my ($user_host, $path) = split(':', $remote);
-  usage("repository name is required") unless defined $path;
+  pod2usage("path is required in repository") unless defined $path;
   $path .= '.git' unless $path =~ m/.git$/;
 
   bless my $self = {
@@ -172,7 +182,37 @@ sub new {
   }, $class
 }
 
+sub rename_remote_branch {
+  # Top level API
+  # connects,
+  # reads and parses the initial message,
+  # sends the rename message
+  # reads and parses the unpack response.
+ 
+  my $self = shift;
+  my $wh = $self->open_ssh($self);
+
+  $self->read_welcome_message();
+  # we only care about errors from ssh at the beginning, e.g. if our repo is rejected.
+  $self->check_for_error_message();
+  $self->write_rename_message();
+  $self->read_confirmation_message();
+
+  close($wh);
+  waitpid($self->{pid}, 0);
+}
+
 sub open_ssh {
+  # Run ssh in a sub-process connected with pipes for input,
+  # output and stderr.
+  #
+  # Creates an IO::Select for each of input, output, stderr
+  # Adds io_read, io_write, and io_err IO::Select objects
+  # and pid of child process to self.
+  #
+  # returns write handle so the caller can explicitly close it
+  # and then wait for the child to complete.
+
   my $self = shift;
   my @ssh_cmd = ($SSH, '-x', $self->{user_host}, $GIT_RECEIVE_PACK, "'$self->{path}'");
   debug("ssh_cmd: @ssh_cmd");
@@ -203,13 +243,26 @@ sub open_ssh {
 }
 
 sub read_welcome_message {
+  # Reads the initial server connect message on io_read, parsing the
+  # SHA and branch referenes.
+  # uses verify_branches to check that old_ref exists and new_ref does not.
+  #
+  # returns the message read.
+
   my $self = shift;
   my $initial_msg = read_io_buffer($self->{io_read}, 10);
   trace("welcome message sysread: $initial_msg");
   $self->verify_branches($initial_msg);
   return $initial_msg;
 }
+
 sub check_for_error_message {
+  # Checks for error messages on io_err at the start of connection
+  # that indicate a rejection of our connection -- most likely an
+  # incorrect repo path.
+  #
+  # returns the message read.
+
   my $self = shift;
   my $error_msg = read_io_buffer($self->{io_err}, 1);
   trace("error_message sysread: $error_msg") if $error_msg;
@@ -218,8 +271,10 @@ sub check_for_error_message {
 }
 
 sub write_rename_message {
+  # Writes the rename message to io_write and returns
+  # the number of bytes written.
   my $self = shift;
-  my $cmd = rename_remote_branch_command($self);
+  my $cmd = $self->rename_remote_branch_command();
   trace("remote cmd: [$cmd]");
 
   my $bytes_written = 0;
@@ -236,6 +291,16 @@ sub write_rename_message {
 }
 
 sub read_confirmation_message {
+  # Reads the server confirmation message io_read and verifies
+  # the expected message pattern with verify_update_response.
+  #
+  # Expected message:
+  #    unpack ok
+  #    ok ref1
+  #    ok ref2
+  #
+  # returns the message read.
+
   my $self = shift;
   my $server_response = read_io_buffer($self->{io_read}, 10);
   trace "confirmation message sysread: [$server_response]";
@@ -243,22 +308,7 @@ sub read_confirmation_message {
   return $server_response;
 }
 
-sub rename_remote_branch {
-  my $self = shift;
-  my $wh = $self->open_ssh($self);
-
-  $self->read_welcome_message();
-  # we only care about errors from ssh at the beginning, e.g. if our repo is rejected.
-  $self->check_for_error_message();
-  $self->write_rename_message();
-  $self->read_confirmation_message();
-
-  close($wh);
-  waitpid($self->{pid}, 0);
-}
-
 sub verify_branches {
-  my ($self, $initial_msg) = @_;
   # Check that $old exists and $new does not
   # return the SHA for $old
   #
@@ -268,6 +318,8 @@ sub verify_branches {
   # ...
   # SHA refs/heads/$branchn
   # ""
+
+  my ($self, $initial_msg) = @_;
   my ($old_sha, $new_sha);
   foreach my $line (split(/\n/, $initial_msg)){
     if ($line =~ m|(\w{40}) \s+ (refs/heads/[^\x00]+)|x) {
@@ -283,8 +335,8 @@ sub verify_branches {
   $self->{sha} = $old_sha;
 
   done "already complete" if !$old_sha and $new_sha;
-  fatal "$self->{old_name} does not exist in remote" unless $old_sha;
-  fatal "$self->{new_name} already exists in remote" if $new_sha;
+  fatal ("$self->{old_name} does not exist in remote", 2) unless $old_sha;
+  fatal ("$self->{new_name} already exists in remote", 2) if $new_sha;
   return 1;
 }
 
@@ -306,7 +358,7 @@ sub verify_update_response {
 
   my %ok;
   foreach my $line (@msgs){
-    if ($line =~ m/ok (.*)/ ) {
+    if ($line =~ m/ok (.*)/i ) {
       $ok{$1} = 1;
     } else {
       fatal "invalid OK reponse: $line\n";
@@ -320,9 +372,14 @@ sub verify_update_response {
 }
 
 sub rename_remote_branch_command {
+  # Create the custom 4 line message to
+  # create new_name and delete old_name
+  # using an valid PACK file with 0 elements that
+  # we can build without access to the refs in the repo.
+
   my $self = shift;
-  #my $options = "\0 report-status side-band-64k agent=git/2.17.1";
   my $options = "\0 report-status agent=git/2.17.1";
+  # importantly, we are not enabling sideband. 
 
   # git-receive-pack message format:
   #   OLD_SHA NEW_SHA BRANCH\0OPTIONS
@@ -334,13 +391,140 @@ sub rename_remote_branch_command {
   # set OLD_SHA to EMPTY_SHA to create a branch
   # set NEW_SHA to EMPTY_SHA to delete a branch
 
-  # delete old_ref by setting NEW_SHA to EMPTY
   # create new_ref by setting OLD_SHA to EMPTY
-  my $cmd = format_line("$self->{sha} $EMPTY_SHA $self->{old_ref}$options\n") .
-            format_line("$EMPTY_SHA $self->{sha} $self->{new_ref}\n") .
+  # delete old_ref by setting NEW_SHA to EMPTY
+  my $cmd = format_line("$EMPTY_SHA $self->{sha} $self->{new_ref}$options\n") .
+            format_line("$self->{sha} $EMPTY_SHA $self->{old_ref}\n") .
             format_line("") .
             $EMPTY_PACK
             ;
 }
 
 main() if not caller();
+
+__END__
+
+=head1 NAME
+
+git remote-rename-branch - Rename a remote branch without requiring a local checkout
+
+=head1 SYNOPSIS
+
+git remote-rename-branch [options] <repository> <old_branch> <new_branch>
+
+  options:
+    --verbose|-v        increase verbosity (can be used multiple times)
+    --quiet|-q          decrease verbosity completely
+    --receive-pack-git  override the executable run on the remote side.
+    --help              this message
+    --man               show the man page
+
+=head1 DESCRIPTION
+
+B<git remote-rename-branch> renames a branch in a remote repository without requiring a local checkout or downloading refs.
+
+This works similarly to the low-level command B<git upload-pack>, except that B<git remote-rename-branch> creates and sends an empty PACK file.
+
+Only ssh format repositories are supported : [user@]host:path/to/repo.git
+
+Upon connection, the remote sends a welcome message contraining the SHA for each branch.  The remote will ignore any input sent before this message is completed.
+
+This program parses the welcome message and extracts the SHA for <old_branch> and verifies that <new_branch> does not exist.
+
+This program then crafts a message to create the new branch and delete the old branch.  This messages is encoded in pack_line format and sent to the remote along with a specially crafted empty_pack_file.
+
+The server then responds with an "unpack ok" message, followed by and "ok <branch>" message for each branch referenced in the sent message.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--verbose|-v>
+
+Increase debug level
+
+=item B<--quiet|-q>
+
+Display no messages (sets DEBUG = -1)
+
+=item B<--receive-pack-git|--exec>
+
+Takes a string argument representing an alternate B<git-receive-pack> exeutable to run on the remote host.
+
+See the documentation for B<git send-pack> for more details.
+
+=item B<--help>
+
+Prints a brief help message and exits.
+
+=item B<--man>
+
+Prints the manual page and exits.
+
+=back
+
+=head1 ENVIRONMENT
+
+=over 4
+
+=item B<GIT_SSH>
+
+Choose an alternate ssh binary.  Defaults to C<ssh>
+
+=item B<DEBUG>
+
+Override the default DEBUG level.  This can also be accomplished using C<--verbose> or C<--quiet>.
+
+=back
+
+=head1 DEFINITIONS
+
+=head2 Rename branch message
+
+    <empty_sha> <old_branch_sha> <new_branch>\0<options>
+    <old_branch_sha> <empty_sha> <old_branch>
+    ""
+    <empty_pack_file>
+
+Example:
+
+    0001
+
+    0000
+    PACK
+
+where <empty_sha> is a string of 40 zeros.
+
+=head2 Pack_line format
+
+Each message in pack_line format is prefixed with a 4 byte length in hex, followed by the message.  The length inclues the 4 bytes of prefix.
+
+Messages may end with a newline, but this must be included in the length. The server is required to treat messages with or without newlines equivalently.
+
+Examples:
+
+    0010hello world\n
+    000Fhello world
+
+The blank message of C<0004> is not allowed.
+
+C<0000> is used as a sync message.
+
+=head2 Message in pack_line format
+
+Connects to remote Verified that <old_branch> exists and <new_branch> does not.
+
+=head2 Empty pack file
+
+The documentation for the git message protocol specify that an empty pack file must be sent when deleting a branch.  In reality, C<git push> and C<git send-pack> do not include a PACK file at all when sending a delete command.
+
+When creating a branch, a normal PACK file is created showing the state of the current repository.
+
+It is possible to create and construct a valid packfile containing zero entries.  This ability is not exposed anywhere in the git libraries.  The closest is C<git send_pack>, which uses C<git pack-ref> to create the pack file to send with the reference sha messages.  The logic for building the messages and packfile and ending them are all hiddne behind a single api function.  If no refs are provided, C<git pack-ref> will exit without creating a packfile rather than create one with zero items.
+
+Git pack file has a format consisting of a 4 character header "PACK" followed by the version (2 or 3) and the number of objects, both encoded in network byte order.  The pack file then contains a 20 byte SHA hash of that message.  This seems very simple but was very difficult to find and test.
+
+    my $EMPTY_PACK = pack("A4NN", "PACK", 2, 0);
+    $EMPTY_PACK .= sha1($EMPTY_PACK);
+
+=cut
