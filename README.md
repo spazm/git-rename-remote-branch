@@ -1,10 +1,10 @@
 # NAME
 
-git remote-rename-branch - Rename a remote branch without requiring a local checkout
+git rename-remote-branch - Rename a remote branch without requiring a local checkout
 
 # SYNOPSIS
 
-git remote-rename-branch \[options\] &lt;repository> &lt;old\_branch> &lt;new\_branch>
+git rename-remote-branch \[options\] &lt;repository> &lt;old\_branch> &lt;new\_branch>
 
     options:
       --verbose|-v        increase verbosity (can be used multiple times)
@@ -15,9 +15,9 @@ git remote-rename-branch \[options\] &lt;repository> &lt;old\_branch> &lt;new\_b
 
 # DESCRIPTION
 
-**git remote-rename-branch** renames a branch in a remote repository without requiring a local checkout or downloading refs.
+**git rename-remote-branch** renames a branch in a remote repository without requiring a local checkout or downloading refs.
 
-This works similarly to the low-level command **git upload-pack**, except that **git remote-rename-branch** creates and sends an empty PACK file.
+This works similarly to the low-level command **git upload-pack**, except that **git rename-remote-branch** creates and sends an empty PACK file.
 
 Only ssh format repositories are supported : \[user@\]host:path/to/repo.git
 
